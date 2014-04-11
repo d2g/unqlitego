@@ -10,8 +10,11 @@ package unqlitego
 import "C"
 
 import (
+	"encoding/json"
 	"fmt"
+	"log"
 	"runtime"
+	"sync"
 	"unsafe"
 )
 
@@ -26,18 +29,47 @@ func (e UnQLiteError) Error() string {
 	return s
 }
 
-const (
-	// UnQLiteNoMemErr ...
-	UnQLiteNoMemErr UnQLiteError = UnQLiteError(C.UNQLITE_NOMEM)
-)
-
 var errString = map[UnQLiteError]string{
-	C.UNQLITE_NOMEM: "Out of memory",
+	C.UNQLITE_LOCKERR:        "Locking protocol error",
+	C.UNQLITE_READ_ONLY:      "Read only Key/Value storage engine",
+	C.UNQLITE_CANTOPEN:       "Unable to open the database file",
+	C.UNQLITE_FULL:           "Full database",
+	C.UNQLITE_VM_ERR:         "Virtual machine error",
+	C.UNQLITE_COMPILE_ERR:    "Compilation error",
+	C.UNQLITE_DONE:           "Operation done", // Not an error.
+	C.UNQLITE_CORRUPT:        "Corrupt pointer",
+	C.UNQLITE_NOOP:           "No such method",
+	C.UNQLITE_PERM:           "Permission error",
+	C.UNQLITE_EOF:            "End Of Input",
+	C.UNQLITE_NOTIMPLEMENTED: "Method not implemented by the underlying Key/Value storage engine",
+	C.UNQLITE_BUSY:           "The database file is locked",
+	C.UNQLITE_UNKNOWN:        "Unknown configuration option",
+	C.UNQLITE_EXISTS:         "Record exists",
+	C.UNQLITE_ABORT:          "Another thread have released this instance",
+	C.UNQLITE_INVALID:        "Invalid parameter",
+	C.UNQLITE_LIMIT:          "Database limit reached",
+	C.UNQLITE_NOTFOUND:       "No such record",
+	C.UNQLITE_LOCKED:         "Forbidden Operation",
+	C.UNQLITE_EMPTY:          "Empty record",
+	C.UNQLITE_IOERR:          "IO error",
+	C.UNQLITE_NOMEM:          "Out of memory",
 }
 
 // Database ...
 type Database struct {
 	handle *C.unqlite
+	name   string
+
+	//Marshalling Functions
+	marshal   MarshalFunction
+	unmarshal UnmarshalFunction
+
+	//Uncommited Changes:
+	uncommitedChanges      int
+	uncommitedChangesMutex sync.Mutex
+
+	//Commit Unit Size: < 1 (After Each)
+	CommitAfter int
 }
 
 // Cursor ...
@@ -53,17 +85,26 @@ func init() {
 	}
 }
 
+//Cache Open Databases
+var openDatabases = map[string]*Database{}
+
 // NewDatabase ...
 func NewDatabase(filename string) (db *Database, err error) {
-	db = &Database{}
-	name := C.CString(filename)
-	defer C.free(unsafe.Pointer(name))
-	res := C.unqlite_open(&db.handle, name, C.UNQLITE_OPEN_CREATE)
-	if res != C.UNQLITE_OK {
-		err = UnQLiteError(res)
-	}
-	if db.handle != nil {
-		runtime.SetFinalizer(db, (*Database).Close)
+	db = openDatabases[filename]
+
+	if db == nil {
+		db = &Database{}
+		db.name = filename
+		name := C.CString(filename)
+		defer C.free(unsafe.Pointer(name))
+		res := C.unqlite_open(&db.handle, name, C.UNQLITE_OPEN_CREATE)
+		if res != C.UNQLITE_OK {
+			err = UnQLiteError(res)
+		}
+		if db.handle != nil {
+			runtime.SetFinalizer(db, (*Database).Close)
+		}
+		openDatabases[filename] = db
 	}
 	return
 }
@@ -76,6 +117,7 @@ func (db *Database) Close() (err error) {
 			err = UnQLiteError(res)
 		}
 		db.handle = nil
+		delete(openDatabases, db.name)
 	}
 	return
 }
@@ -377,6 +419,108 @@ func Ident() string {
 // Copyright ...
 func Copyright() string {
 	return C.GoString(C.unqlite_lib_copyright())
+}
+
+type MarshalFunction func(interface{}) ([]byte, error)
+type UnmarshalFunction func([]byte, interface{}) error
+
+func (t *Database) Marshal() MarshalFunction {
+	if t.marshal != nil {
+		return t.marshal
+	} else {
+		return json.Marshal
+	}
+}
+
+func (t *Database) SetMarshal(override MarshalFunction) {
+	t.marshal = override
+}
+
+func (t *Database) Unmarshal() UnmarshalFunction {
+	if t.unmarshal != nil {
+		return t.unmarshal
+	} else {
+		return json.Unmarshal
+	}
+}
+
+func (t *Database) SetUnmarshal(override UnmarshalFunction) {
+	t.unmarshal = override
+}
+
+func (t *Database) SetObject(key string, object interface{}) error {
+	byteObject, err := t.Marshal()(object)
+
+	if err != nil {
+		return err
+	}
+
+	t.uncommitedChangesMutex.Lock()
+	err = t.Store([]byte(key), byteObject)
+	if err != nil {
+		t.Rollback()
+		return err
+	}
+
+	t.uncommitedChanges++
+
+	if t.uncommitedChanges >= t.CommitAfter {
+		err = t.Commit()
+		if err != nil {
+			t.Rollback()
+			return err
+		}
+		t.uncommitedChanges = 0
+	}
+	t.uncommitedChangesMutex.Unlock()
+
+	return nil
+}
+
+func (t *Database) GetObject(key string, object interface{}) error {
+
+	byteObject, err := t.Fetch([]byte(key))
+	if err != nil {
+		if err == UnQLiteError(-6) {
+			//Not Found is not an error in my world...
+			return nil
+		}
+		return err
+	}
+
+	if byteObject != nil {
+		err = t.Unmarshal()(byteObject, object)
+		if err != nil {
+			//Create a Slightly More Meaningful Error Message.
+			log.Printf("Error: Unable to Unmarshal Bytes %v\n", byteObject)
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (t *Database) DeleteObject(key string) error {
+	t.uncommitedChangesMutex.Lock()
+	err := t.Delete([]byte(key))
+	if err != nil {
+		t.Rollback()
+		return err
+	}
+
+	t.uncommitedChanges++
+
+	if t.uncommitedChanges >= t.CommitAfter {
+		err = t.Commit()
+		if err != nil {
+			t.Rollback()
+			return err
+		}
+		t.uncommitedChanges = 0
+	}
+	t.uncommitedChangesMutex.Unlock()
+
+	return nil
 }
 
 /* TODO: implement
